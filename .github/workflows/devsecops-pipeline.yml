@@ -303,3 +303,52 @@ jobs:
         with:
           name: week2-metrics-dashboard
           path: METRICS_DASHBOARD.md
+
+# ==========================================
+  # STAGE 6: GenAI Triage & Auto-PRs (Week 3)
+  # ==========================================
+  genai-triage:
+    name: GenAI Triage & Remediation PRs
+    needs: [metrics-dashboard]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download all scan artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: all-reports/
+
+      - name: Prepare Findings Folder
+        run: |
+          mkdir -p collected-reports
+          find all-reports/ -type f -name "*.json" -exec cp {} collected-reports/ \;
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Run Redaction and LLM Triage
+        env:
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }} # Optional; uses deterministic fallback if absent
+        run: |
+          python3 scripts/ai_triage.py --scan-dir collected-reports --output-json triage_output.json
+
+      - name: Create 3 Sample Remediation PRs
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python3 scripts/create_remediation_prs.py
+
+      - name: Upload Triage Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: week3-triage-output
+          path: triage_output.json            
