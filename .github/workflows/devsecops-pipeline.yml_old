@@ -1,0 +1,124 @@
+name: DevSecOps Shift-Left Pipeline
+
+on:
+  push:
+    branches: [ "master" ]
+  pull_request:
+    branches: [ "master" ]
+  workflow_dispatch:
+
+jobs:
+  # ==========================================
+  # STAGE 1: Secrets Scanning
+  # ==========================================
+  secrets-scan:
+    name: Secrets Detection (Gitleaks)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Run Gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          SECRET_TOKEN: ${{ secrets.SECRET_TOKEN }}
+        continue-on-error: true # For Juice Shop, don't break pipeline on pre-existing deliberate mock secrets
+
+  # ==========================================
+  # STAGE 2: SAST (Semgrep)
+  # ==========================================
+  sast-scan:
+    name: SAST (Semgrep)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@v4
+
+      - name: Run Semgrep OSS Scan
+        run: |
+          docker run --rm -v "${PWD}:/src" returntocorp/semgrep semgrep scan \
+            --config "p/default" \
+            --config "p/owasp-top-ten" \
+            --json -o /src/semgrep-results.json || true
+
+      - name: Upload SAST Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: semgrep-report
+          path: semgrep-results.json
+
+  # ==========================================
+  # STAGE 3: SCA & Container Scanning (Trivy + Syft)
+  # ==========================================
+  sca-container-scan:
+    name: SCA & Container Security (Trivy + Syft)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@v4
+
+      - name: Generate SBOM (Syft)
+        uses: anchore/sbom-action@v0
+        with:
+          image: bkimminich/juice-shop:latest
+          format: cyclonedx-json
+          output-file: juice-shop-sbom.json
+
+      - name: Run Trivy FS (Dependencies & SCA)
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          format: 'json'
+          output: 'trivy-fs-results.json'
+          severity: 'CRITICAL,HIGH'
+          exit-code: '0'
+
+      - name: Run Trivy Container Scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: 'bkimminich/juice-shop:latest'
+          format: 'table'
+          severity: 'CRITICAL,HIGH'
+          exit-code: '0'
+
+      - name: Upload SCA & SBOM Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: sca-and-sbom
+          path: |
+            juice-shop-sbom.json
+            trivy-fs-results.json
+
+  # ==========================================
+  # STAGE 4: Local Kind Deployment & Runtime Test
+  # ==========================================
+  deploy-kind:
+    name: Build & Deploy to Kind Cluster
+    needs: [secrets-scan, sast-scan, sca-container-scan]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@v4
+
+      - name: Create kind cluster
+        uses: helm/kind-action@v1
+        with:
+          cluster_name: juice-shop-cluster
+
+      - name: Deploy Juice Shop
+        run: |
+          kubectl apply -f k8s/juice-shop.yaml
+          kubectl wait --for=condition=ready pod -l app=juice-shop --timeout=180s
+
+      - name: Verify Service Health
+        run: |
+          kubectl get nodes
+          kubectl get pods -o wide
+          kubectl get svc
+          # Port forward to test runtime availability
+          kubectl port-forward svc/juice-shop-service 3000:3000 &
+          sleep 5
+          curl -I http://localhost:3000 || exit 1

@@ -26,11 +26,23 @@ jobs:
           SECRET_TOKEN: ${{ secrets.SECRET_TOKEN }}
         continue-on-error: true # For Juice Shop, don't break pipeline on pre-existing deliberate mock secrets
 
+      # Week 2: Export JSON report for the metrics aggregator
+      - name: Export Gitleaks JSON Report
+        run: |
+          docker run --rm -v "${PWD}:/path" zricethezav/gitleaks:latest detect \
+            --source="/path" --report-format=json --report-path=/path/gitleaks-results.json --exit-code=0 || true
+
+      - name: Upload Secrets Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: gitleaks-report
+          path: gitleaks-results.json
+
   # ==========================================
-  # STAGE 2: SAST (Semgrep)
+  # STAGE 2: SAST (Semgrep) & IaC (Checkov)
   # ==========================================
   sast-scan:
-    name: SAST (Semgrep)
+    name: SAST (Semgrep) & IaC (Checkov)
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Source Code
@@ -43,11 +55,23 @@ jobs:
             --config "p/owasp-top-ten" \
             --json -o /src/semgrep-results.json || true
 
-      - name: Upload SAST Artifact
+      # Week 2 addition: Infrastructure-as-Code scan on k8s manifests
+      - name: Run Checkov IaC Scan
+        uses: bridgecrewio/checkov-action@master
+        with:
+          framework: kubernetes
+          directory: k8s/
+          output_format: json
+          output_file_path: checkov-results.json
+          soft_fail: true
+
+      - name: Upload SAST & IaC Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: semgrep-report
-          path: semgrep-results.json
+          name: sast-iac-reports
+          path: |
+            semgrep-results.json
+            checkov-results.json
 
   # ==========================================
   # STAGE 3: SCA & Container Scanning (Trivy + Syft)
@@ -76,11 +100,13 @@ jobs:
           severity: 'CRITICAL,HIGH'
           exit-code: '0'
 
+      # Week 2 update: Export JSON for metrics aggregation while retaining terminal output
       - name: Run Trivy Container Scan
         uses: aquasecurity/trivy-action@master
         with:
           image-ref: 'bkimminich/juice-shop:latest'
-          format: 'table'
+          format: 'json'
+          output: 'trivy-image-results.json'
           severity: 'CRITICAL,HIGH'
           exit-code: '0'
 
@@ -91,12 +117,13 @@ jobs:
           path: |
             juice-shop-sbom.json
             trivy-fs-results.json
+            trivy-image-results.json
 
   # ==========================================
-  # STAGE 4: Local Kind Deployment & Runtime Test
+  # STAGE 4: Local Kind Deployment & DAST Scan
   # ==========================================
   deploy-kind:
-    name: Build & Deploy to Kind Cluster
+    name: Build & Deploy to Kind Cluster (with DAST)
     needs: [secrets-scan, sast-scan, sca-container-scan]
     runs-on: ubuntu-latest
     steps:
@@ -118,7 +145,161 @@ jobs:
           kubectl get nodes
           kubectl get pods -o wide
           kubectl get svc
-          # Port forward to test runtime availability
+          # Port forward to host runner
           kubectl port-forward svc/juice-shop-service 3000:3000 &
           sleep 5
-          curl -I http://localhost:3000 || exit 1
+          curl -I http://127.0.0.1:3000 || exit 1
+
+      # Week 2 addition: OWASP ZAP Baseline DAST
+      - name: Run OWASP ZAP Baseline DAST Scan
+        run: |
+          mkdir -p zap-out
+          docker run --rm --net="host" -v "${PWD}/zap-out:/zap/wrk/:rw" \
+            ghcr.io/zaproxy/zaproxy:stable zap-baseline.py \
+            -t http://127.0.0.1:3000 \
+            -J zap-results.json \
+            -r zap-report.html || true
+
+      - name: Upload DAST Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: zap-dast-reports
+          path: zap-out/
+
+  # ==========================================
+  # STAGE 5: Metrics Dashboard
+  # ==========================================
+  metrics-dashboard:
+    name: Generate Metrics Dashboard
+    needs: [deploy-kind]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@v4
+
+      - name: Download all scan artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: all-reports/
+
+      - name: Consolidate and Aggregate Metrics
+        run: |
+          mkdir -p collected-reports
+          find all-reports/ -type f \( -name "*.json" -o -name "*.html" \) -exec cp {} collected-reports/ \;
+
+          python3 - << 'EOF'
+          import json, os, glob
+
+          def count_findings():
+              data = {
+                  "Gitleaks (Secrets)": {"Critical": 0, "High": 0, "Medium": 0, "Low": 0},
+                  "Semgrep (SAST)": {"Critical": 0, "High": 0, "Medium": 0, "Low": 0},
+                  "Checkov (IaC)": {"Critical": 0, "High": 0, "Medium": 0, "Low": 0},
+                  "Trivy FS (SCA)": {"Critical": 0, "High": 0, "Medium": 0, "Low": 0},
+                  "Trivy Image": {"Critical": 0, "High": 0, "Medium": 0, "Low": 0},
+                  "OWASP ZAP (DAST)": {"Critical": 0, "High": 0, "Medium": 0, "Low": 0}
+              }
+
+              # Gitleaks
+              if os.path.exists("collected-reports/gitleaks-results.json"):
+                  try:
+                      with open("collected-reports/gitleaks-results.json") as f:
+                          leaks = json.load(f)
+                          data["Gitleaks (Secrets)"]["High"] = len(leaks) if isinstance(leaks, list) else 0
+                  except Exception: pass
+
+              # Semgrep
+              if os.path.exists("collected-reports/semgrep-results.json"):
+                  try:
+                      with open("collected-reports/semgrep-results.json") as f:
+                          sem = json.load(f)
+                          for r in sem.get("results", []):
+                              sev = r.get("extra", {}).get("severity", "MEDIUM").upper()
+                              if sev in ["ERROR", "CRITICAL"]: data["Semgrep (SAST)"]["Critical"] += 1
+                              elif sev == "WARNING": data["Semgrep (SAST)"]["High"] += 1
+                              else: data["Semgrep (SAST)"]["Medium"] += 1
+                  except Exception: pass
+
+              # Checkov
+              if os.path.exists("collected-reports/checkov-results.json"):
+                  try:
+                      with open("collected-reports/checkov-results.json") as f:
+                          chk = json.load(f)
+                          reports = chk if isinstance(chk, list) else [chk]
+                          for rep in reports:
+                              for f_item in rep.get("results", {}).get("failed_checks", []):
+                                  sev = (f_item.get("severity") or "MEDIUM").upper()
+                                  if sev in data["Checkov (IaC)"]:
+                                      data["Checkov (IaC)"][sev] += 1
+                                  else:
+                                      data["Checkov (IaC)"]["Medium"] += 1
+                  except Exception: pass
+
+              # Trivy FS
+              if os.path.exists("collected-reports/trivy-fs-results.json"):
+                  try:
+                      with open("collected-reports/trivy-fs-results.json") as f:
+                          triv = json.load(f)
+                          for r in triv.get("Results", []):
+                              for v in r.get("Vulnerabilities", []):
+                                  s = v.get("Severity", "LOW").capitalize()
+                                  if s in data["Trivy FS (SCA)"]: data["Trivy FS (SCA)"][s] += 1
+                  except Exception: pass
+
+              # Trivy Image
+              if os.path.exists("collected-reports/trivy-image-results.json"):
+                  try:
+                      with open("collected-reports/trivy-image-results.json") as f:
+                          triv = json.load(f)
+                          for r in triv.get("Results", []):
+                              for v in r.get("Vulnerabilities", []):
+                                  s = v.get("Severity", "LOW").capitalize()
+                                  if s in data["Trivy Image"]: data["Trivy Image"][s] += 1
+                  except Exception: pass
+
+              # ZAP
+              if os.path.exists("collected-reports/zap-results.json"):
+                  try:
+                      with open("collected-reports/zap-results.json") as f:
+                          zap = json.load(f)
+                          for site in zap.get("site", []):
+                              for alert in site.get("alerts", []):
+                                  rc = str(alert.get("riskcode", "1"))
+                                  if rc == "3": data["OWASP ZAP (DAST)"]["High"] += 1
+                                  elif rc == "2": data["OWASP ZAP (DAST)"]["Medium"] += 1
+                                  else: data["OWASP ZAP (DAST)"]["Low"] += 1
+                  except Exception: pass
+
+              # Render Markdown Dashboard
+              total_all = 0
+              summary_lines = []
+              summary_lines.append("# 🛡️ DevSecOps Shift-Left Security Dashboard (Week 1 + Week 2)")
+              summary_lines.append("")
+              summary_lines.append("| Tool / Stage | Critical | High | Medium | Low | Total Caught |")
+              summary_lines.append("| :--- | :---: | :---: | :---: | :---: | :---: |")
+
+              for tool, counts in data.items():
+                  t_sum = sum(counts.values())
+                  total_all += t_sum
+                  summary_lines.append(f"| **{tool}** | {counts['Critical']} | {counts['High']} | {counts['Medium']} | {counts['Low']} | **{t_sum}** |")
+
+              summary_lines.append("")
+              summary_lines.append(f"> **Total Pipeline Findings:** `{total_all}` across Secrets, SAST, SCA, IaC, and DAST.")
+
+              content = "\n".join(summary_lines)
+              with open("METRICS_DASHBOARD.md", "w") as out:
+                  out.write(content)
+
+              summary_env = os.environ.get("GITHUB_STEP_SUMMARY")
+              if summary_env:
+                  with open(summary_env, "a") as f_sum:
+                      f_sum.write(content)
+
+          count_findings()
+          EOF
+
+      - name: Upload Final Metrics Dashboard
+        uses: actions/upload-artifact@v4
+        with:
+          name: week2-metrics-dashboard
+          path: METRICS_DASHBOARD.md
